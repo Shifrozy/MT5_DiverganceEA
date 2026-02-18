@@ -1,0 +1,12 @@
+# MetaTrader compiled files
+*.ex5
+*.ex4
+
+# Logs
+*.log
+
+# VS Code
+.vscode/
+
+# Git
+.git/
