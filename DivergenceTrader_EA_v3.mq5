@@ -172,6 +172,7 @@ PendingSignal currentSignal;
 
 datetime lastBarTime = 0;
 datetime lastProcessedSignalTime[6]; // Track last processed signal per TF
+datetime lastTradeTime = 0;          // Cooldown timer to prevent dual trades
 bool hasOpenPosition = false;
 int currentTicket = 0;
 ENUM_TIMEFRAMES activeTradeSignalTF = PERIOD_CURRENT; // Track active trade source TF
@@ -283,15 +284,21 @@ int OnInit()
    ArraySetAsSeries(ema50Buffer, true);
    
    ZeroMemory(currentSignal);
-   for(int i=0; i<6; i++) lastProcessedSignalTime[i] = 0;
+   
+   // Pre-fill signal times with CURRENT bar times to ignore all pre-existing divergences
+   for(int i=0; i<6; i++) {
+      if(enabledTFs[i])
+         lastProcessedSignalTime[i] = iTime(_Symbol, trackedTFs[i], 1); // Mark Bar 1 as already seen
+      else
+         lastProcessedSignalTime[i] = TimeCurrent();
+   }
+   lastTradeTime = TimeCurrent(); // Startup cooldown - no trades for 60 seconds
    
    // Initial zone detection so we don't wait for first bar
    DetectSupportResistanceZones();
    DetectSupplyDemandZones();
    
-   Print("Sniper Divergence EA Initialized. Over-trading protection active.");
-   return INIT_SUCCEEDED;
-   
+   Print("Sniper Divergence EA Initialized. Startup cooldown active (60s).");
    return INIT_SUCCEEDED;
 }
 
@@ -335,58 +342,48 @@ void OnTick()
       DetectSupplyDemandZones();
    }
    
-   // SCANNING PHASE: Priority given to Higher Timeframes
-   for(int i=0; i<6; i++) {
-      if(enabledTFs[i]) {
+   // ===== GUARD: Only scan if NO position is open AND cooldown has passed =====
+   if(!hasOpenPosition && (TimeCurrent() - lastTradeTime > 60)) {
+      // SCANNING PHASE: Priority given to Higher Timeframes
+      for(int i=0; i<6; i++) {
+         if(!enabledTFs[i]) continue;
+         
          if(ScanDivergenceForTF(trackedTFs[i], htf_rsi_handles[i])) {
             datetime signalBarTime = iTime(_Symbol, trackedTFs[i], lastDivergence.priceBar1);
             
-            // Safety: Skip if this specific signal was already processed
+            // Skip if this specific signal was already processed
             if(signalBarTime <= lastProcessedSignalTime[i]) continue;
             
-            // MANDATORY RULE: Divergence MUST be inside or near a zone to be accepted
+            // ZONE CHECK: Divergence MUST be inside or near a zone
             string dummyZone = "";
             bool inManualZone = IsPriceInZone(lastDivergence.price1, lastDivergence.isBullish, dummyZone);
             bool nearEMA = IsPriceNearHTFEMA(lastDivergence.price1, trackedTFs[i]);
-            
             if(!inManualZone && !nearEMA) continue;
             
-            // Freshness: Only accept if the recent swing point is fresh (within 15 bars)
-            if(lastDivergence.priceBar1 > SwingStrength + 15) continue;
-
-            // Priority: Only replace if new signal is from a higher or same TF
-            if(!currentSignal.active || i <= 2) { 
-               currentSignal.active = true;
-               currentSignal.signalTF = trackedTFs[i];
-               currentSignal.isBullish = lastDivergence.isBullish;
-               currentSignal.detectionTime = TimeCurrent();
-               currentSignal.swingPrice = lastDivergence.price1;
-               currentSignal.divergenceType = lastDivergence.isRegular ? "Reg" : "Hid";
-               
-               Print("IMMEDIATE SNIPER SIGNAL: ", currentSignal.divergenceType, " ", (currentSignal.isBullish?"BULL":"BEAR"), 
-                     " on ", EnumToString(currentSignal.signalTF), ". Executing NOW.");
-               
-               // RULE: Execute IMMEDIATELY upon detection (Zero Lag)
-               activeTradeSignalTF = currentSignal.signalTF;
-               if(ExecuteBufferedTrade()) {
-                  lastProcessedSignalTime[i] = signalBarTime; // ONLY mark as seen if trade successful
-               }
-               ZeroMemory(currentSignal); // Clear after immediate execution
-               break; 
+            // FRESHNESS: Only accept VERY recent divergences (within 5 bars)
+            if(lastDivergence.priceBar1 > 5) continue;
+            
+            // === IMMEDIATE EXECUTION ===
+            currentSignal.active = true;
+            currentSignal.signalTF = trackedTFs[i];
+            currentSignal.isBullish = lastDivergence.isBullish;
+            currentSignal.detectionTime = TimeCurrent();
+            currentSignal.swingPrice = lastDivergence.price1;
+            currentSignal.divergenceType = lastDivergence.isRegular ? "Reg" : "Hid";
+            
+            Print("SNIPER: ", currentSignal.divergenceType, " ", (currentSignal.isBullish?"BULL":"BEAR"), 
+                  " on ", EnumToString(trackedTFs[i]), " @ ", lastDivergence.price1, ". Executing NOW.");
+            
+            activeTradeSignalTF = trackedTFs[i];
+            if(ExecuteBufferedTrade()) {
+               lastProcessedSignalTime[i] = signalBarTime;
+               lastTradeTime = TimeCurrent(); // Start cooldown
             }
+            ZeroMemory(currentSignal);
+            break; // ONE trade per tick maximum
          }
       }
-   }
-   
-   // ENTRY PHASE: (Legacy Sniper Wait - Disabled for Immediate Execution)
-   // Now handled inside Scanning Phase for zero lag.
-   
-   // Safety: In case a signal was set but not executed
-   if(currentSignal.active && !hasOpenPosition) {
-       activeTradeSignalTF = currentSignal.signalTF;
-       ExecuteBufferedTrade();
-       ZeroMemory(currentSignal);
-   }
+   } // end guard
    
    // DYNAMIC TP & BREAK-EVEN PHASE: Handle open positions
    if(hasOpenPosition) {
@@ -496,13 +493,20 @@ bool ScanDivergenceForTF(ENUM_TIMEFRAMES tf, int handle)
    ArrayResize(swingHighs, 0); ArrayResize(swingLows, 0);
    if(CopyBuffer(handle, 0, 0, MaxBarsBack + 10, rsiBuffer) <= 0) return false;
    
-   for(int i = 1; i < MaxBarsBack - 1; i++) {
+   for(int i = 2; i < MaxBarsBack - 1; i++) {
       double high = iHigh(_Symbol, tf, i);
       double low = iLow(_Symbol, tf, i);
       bool isSH = true, isSL = true;
+      
+      // Asymmetric detection: Full SwingStrength on LEFT, only 1 bar on RIGHT (for speed)
+      // Right side (towards current price) - just 1 bar confirmation
+      if(iHigh(_Symbol, tf, i-1) >= high) isSH = false;
+      if(iLow(_Symbol, tf, i-1) <= low) isSL = false;
+      
+      // Left side (historical) - full SwingStrength confirmation
       for(int j = 1; j <= SwingStrength; j++) {
-         if(iHigh(_Symbol, tf, i+j) >= high || iHigh(_Symbol, tf, i-j) >= high) isSH = false;
-         if(iLow(_Symbol, tf, i+j) <= low || iLow(_Symbol, tf, i-j) <= low) isSL = false;
+         if(iHigh(_Symbol, tf, i+j) >= high) isSH = false;
+         if(iLow(_Symbol, tf, i+j) <= low) isSL = false;
       }
       if(isSH) {
          SwingPoint sp = {i, high, rsiBuffer[i], true};
